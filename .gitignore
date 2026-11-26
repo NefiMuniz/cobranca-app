@@ -1,0 +1,24 @@
+# .NET
+bin/
+obj/
+TestResults/
+*.user
+.vs/
+
+# Node
+node_modules/
+dist/
+
+# AWS SAM
+.aws-sam/
+samconfig.toml
+
+# Local secrets and data
+.env
+.env.local
+*.xlsx
+*.db
+*.sqlite
+
+# Internal run/deploy notes (kept local)
+INSTRUCTIONS.md

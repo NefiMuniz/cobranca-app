@@ -1,0 +1,201 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Cobranca - billing tracker. ASP.NET Core API on Lambda (Function URL), DynamoDB single table,
+  React SPA on S3 behind CloudFront. Sized to stay inside the AWS always-free allowances.
+
+Parameters:
+  AdminUsername:
+    Type: String
+    Default: admin
+  AdminPasswordHash:
+    Type: String
+    NoEcho: true
+    Description: Output of `dotnet run --project backend/src/Cobranca.Api -- hash-password "<password>"`.
+  JwtKey:
+    Type: String
+    NoEcho: true
+    MinLength: 32
+    Description: Random secret of at least 32 characters used to sign login tokens.
+  ApiMaxConcurrency:
+    Type: Number
+    Default: 0
+    MinValue: 0
+    Description: >
+      Hard cap on simultaneous API executions (reserved concurrency), the ceiling on what a traffic flood can cost.
+      0 = no cap. New accounts usually cannot reserve concurrency until AWS raises their account limit.
+  BudgetEmail:
+    Type: String
+    Default: ""
+    Description: E-mail for cost alerts. Empty = no budget is created.
+  MonthlyBudgetUsd:
+    Type: Number
+    Default: 5
+    Description: Monthly cost (USD) that triggers the alerts (80% actual, 100% forecast).
+
+Conditions:
+  HasConcurrencyCap: !Not [!Equals [!Ref ApiMaxConcurrency, 0]]
+  HasBudget: !Not [!Equals [!Ref BudgetEmail, ""]]
+
+Globals:
+  Function:
+    Runtime: dotnet10
+    Architectures: [arm64]
+    MemorySize: 512
+    # Short timeout: a stuck or abused request cannot keep billing for long.
+    Timeout: 10
+
+Resources:
+  BillingTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      AttributeDefinitions:
+        - { AttributeName: PK, AttributeType: S }
+        - { AttributeName: SK, AttributeType: S }
+      KeySchema:
+        - { AttributeName: PK, KeyType: HASH }
+        - { AttributeName: SK, KeyType: RANGE }
+      # The always-free DynamoDB allowance applies to provisioned capacity (25 RCU / 25 WCU), not to on-demand.
+      # Provisioned capacity is also a cost ceiling: a flood is throttled instead of billed per request.
+      BillingMode: PROVISIONED
+      ProvisionedThroughput:
+        ReadCapacityUnits: 25
+        WriteCapacityUnits: 10
+
+  ApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../backend/src/Cobranca.Api/
+      # Executable assembly hosted with AddAWSLambdaHosting: the handler is the assembly name.
+      Handler: Cobranca.Api
+      ReservedConcurrentExecutions: !If [HasConcurrencyCap, !Ref ApiMaxConcurrency, !Ref AWS::NoValue]
+      LoggingConfig:
+        LogGroup: !Ref ApiLogGroup
+        LogFormat: Text
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref BillingTable
+      Environment:
+        Variables:
+          Storage__Provider: DynamoDb
+          Storage__TableName: !Ref BillingTable
+          Auth__Username: !Ref AdminUsername
+          Auth__PasswordHash: !Ref AdminPasswordHash
+          Auth__JwtKey: !Ref JwtKey
+          Cors__AllowedOrigins__0: !Sub "https://${Distribution.DomainName}"
+          # Only warnings and errors are logged in production: log volume (and its cost) does not grow with traffic.
+          Logging__LogLevel__Default: Warning
+      # Function URL instead of API Gateway: no extra service to pay for. Auth happens in the app (JWT).
+      FunctionUrlConfig:
+        AuthType: NONE
+
+  # Explicit log group so old logs expire instead of accumulating storage cost forever.
+  ApiLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-api"
+      RetentionInDays: 14
+
+  CostBudget:
+    Type: AWS::Budgets::Budget
+    Condition: HasBudget
+    Properties:
+      Budget:
+        BudgetName: !Sub "${AWS::StackName}-monthly"
+        BudgetType: COST
+        TimeUnit: MONTHLY
+        BudgetLimit:
+          Amount: !Ref MonthlyBudgetUsd
+          Unit: USD
+      NotificationsWithSubscribers:
+        - Notification:
+            NotificationType: ACTUAL
+            ComparisonOperator: GREATER_THAN
+            Threshold: 80
+          Subscribers:
+            - { SubscriptionType: EMAIL, Address: !Ref BudgetEmail }
+        - Notification:
+            NotificationType: FORECASTED
+            ComparisonOperator: GREATER_THAN
+            Threshold: 100
+          Subscribers:
+            - { SubscriptionType: EMAIL, Address: !Ref BudgetEmail }
+
+  # Public Function URLs need lambda:InvokeFunction in addition to the InvokeFunctionUrl permission SAM adds.
+  ApiFunctionInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ApiFunction
+      Principal: "*"
+      InvokedViaFunctionUrl: true
+
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  FrontendOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "${AWS::StackName}-frontend"
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        DefaultRootObject: index.html
+        HttpVersion: http2and3
+        Origins:
+          - Id: frontend
+            DomainName: !GetAtt FrontendBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt FrontendOriginAccessControl.Id
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+        DefaultCacheBehavior:
+          TargetOriginId: frontend
+          ViewerProtocolPolicy: redirect-to-https
+          Compress: true
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6 # Managed-CachingOptimized
+        # SPA routing: unknown paths (e.g. /clientes/123) are served by index.html.
+        CustomErrorResponses:
+          - { ErrorCode: 403, ResponseCode: 200, ResponsePagePath: /index.html }
+          - { ErrorCode: 404, ResponseCode: 200, ResponsePagePath: /index.html }
+
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal: { Service: cloudfront.amazonaws.com }
+            Action: s3:GetObject
+            Resource: !Sub "${FrontendBucket.Arn}/*"
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${Distribution}"
+
+Outputs:
+  ApiUrl:
+    Description: Lambda Function URL (use as VITE_API_BASE_URL, without the trailing slash)
+    Value: !GetAtt ApiFunctionUrl.FunctionUrl
+  FrontendUrl:
+    Value: !Sub "https://${Distribution.DomainName}"
+  FrontendBucketName:
+    Value: !Ref FrontendBucket
+  DistributionId:
+    Value: !Ref Distribution
+  TableName:
+    Value: !Ref BillingTable

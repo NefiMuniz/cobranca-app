@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <PropertyGroup>
+    <AssemblyName>Cobranca.Api</AssemblyName>
+    <RootNamespace>Cobranca.Api</RootNamespace>
+    <!-- Required so the Lambda .NET runtime can start this executable assembly. -->
+    <GenerateRuntimeConfigurationFiles>true</GenerateRuntimeConfigurationFiles>
+    <AWSProjectType>Lambda</AWSProjectType>
+    <!-- Local credentials live in user secrets (outside the repo), loaded automatically in Development. -->
+    <UserSecretsId>cobranca-api-dev</UserSecretsId>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Amazon.Lambda.AspNetCoreServer.Hosting" Version="1.*" />
+    <PackageReference Include="AWSSDK.DynamoDBv2" Version="4.*" />
+    <PackageReference Include="Microsoft.AspNetCore.Authentication.JwtBearer" Version="10.*" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Cobranca.Domain\Cobranca.Domain.csproj" />
+  </ItemGroup>
+
+</Project>

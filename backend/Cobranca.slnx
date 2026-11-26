@@ -1,0 +1,9 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/Cobranca.Domain/Cobranca.Domain.csproj" />
+    <Project Path="src/Cobranca.Api/Cobranca.Api.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Cobranca.Tests/Cobranca.Tests.csproj" />
+  </Folder>
+</Solution>
